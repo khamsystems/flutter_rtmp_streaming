@@ -16,6 +16,14 @@ package com.app.rtmp_streaming
  * Any query string is dropped wholesale rather than parsed -- some providers pass
  * auth tokens there, and dropping is the safe default for a shape we have not
  * enumerated.
+ *
+ * KNOWN LIMITATION: this covers only this plugin's own logging. RootEncoder's
+ * CommandsManager logs the AMF releaseStream / FCPublish / publish commands, and
+ * those carry the RTMP stream name -- which for Cloudflare Stream is the key. It
+ * calls android.util.Log.i unconditionally and RtmpStreamClient.setLogs(false)
+ * does not reach it (that only gates RtmpSender), so the key still reaches
+ * logcat on every connect. Closing that needs a patched RootEncoder; it is a
+ * deliberate open item, not an oversight.
  */
 internal fun redactStreamUrl(url: String?): String {
     if (url.isNullOrEmpty()) return "(none)"

@@ -120,8 +120,37 @@ class CameraNativeView(
         bitrateAdapter = BitrateAdapter {
             rtmpCamera.setVideoBitrateOnFly(it)
         }.apply {
-            setMaxBitrate(vBitrate + aBitrate)
+            // Video-only ceiling. The adapter drives setVideoBitrateOnFly, so folding the
+            // audio bitrate in here was letting the video encoder be told to use bandwidth
+            // the audio encoder is separately spending.
+            setMaxBitrate(vBitrate)
         }
+    }
+
+    /**
+     * Re-point the adaptive ceiling at the video bitrate that was actually requested.
+     *
+     * The adapter only ever adapts *downwards* from its max, so the max has to track the
+     * requested bitrate. It used to be pinned to the `vBitrate + aBitrate` constant, which
+     * capped every stream at 1328000bps within a few callbacks no matter what the caller
+     * asked for.
+     *
+     * Call this anywhere the requested video bitrate is established or changed
+     * (startVideoStreaming, setVideoSettings, stream resume). BitrateAdapter.setMaxBitrate
+     * also resets the adapter's running average, so the next congestion decision is made
+     * against the new ceiling rather than against history from the old one.
+     *
+     * The adaptive step-down itself is untouched: this raises the roof, it does not stop
+     * the adapter backing off when the network is congested. Called from the main thread;
+     * the adapter is read from the RootEncoder network thread in [onNewBitrate].
+     */
+    private fun applyBitrateCeiling(videoBitrate: Int) {
+        if (videoBitrate <= 0) {
+            Log.w("CameraNativeView", "applyBitrateCeiling ignoring non-positive bitrate: $videoBitrate")
+            return
+        }
+        bitrateAdapter.setMaxBitrate(videoBitrate)
+        Log.d("CameraNativeView", "BitrateAdapter max bitrate set to $videoBitrate bps")
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
@@ -292,6 +321,9 @@ class CameraNativeView(
         try {
             if (bitrate != null) {
                 customVideoBitrate = bitrate
+                // Raise/lower the adaptive ceiling with the request, otherwise the adapter
+                // pulls an on-the-fly increase straight back down on the next callback.
+                applyBitrateCeiling(bitrate)
                 if (rtmpCamera.isStreaming) {
                     rtmpCamera.setVideoBitrateOnFly(bitrate)
                 }
@@ -415,6 +447,9 @@ class CameraNativeView(
                 val streamingSize = CameraUtils.computeBestPreviewSize(getActivity(), cameraName, preset)
                 val size = streamingSize["size"] as Size
                 val bitrateRes = customVideoBitrate ?: (bitrate ?: (streamingSize["bitrate"] as Int))
+                // The encoder is prepared at bitrateRes, so that is what the adapter must
+                // treat as its ceiling.
+                applyBitrateCeiling(bitrateRes)
                 rtmpCamera.forceBt709Color(forceBt709Color)
                 (rtmpCamera.streamClient as? RtmpStreamClient)?.shouldSendPings(rtmpShouldSendPings)
                 if (rtmpCamera.isRecording || prepareAudioEncoder() && prepareVideoEncoder(
@@ -1097,6 +1132,9 @@ class CameraNativeView(
             val streamingSize = CameraUtils.computeBestPreviewSize(getActivity(), cameraName, preset)
             val size = streamingSize["size"] as Size
             val bitrateRes = lastStreamBitrate ?: customVideoBitrate ?: (streamingSize["bitrate"] as Int)
+            // Resuming re-prepares the encoder, so the ceiling has to be re-applied too --
+            // the adapter may have stepped down before the surface was destroyed.
+            applyBitrateCeiling(bitrateRes)
             rtmpCamera.forceBt709Color(forceBt709Color)
             (rtmpCamera.streamClient as? RtmpStreamClient)?.shouldSendPings(rtmpShouldSendPings)
             val prepared = prepareAudioEncoder() && prepareVideoEncoder(size, bitrateRes)

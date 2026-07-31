@@ -124,7 +124,17 @@ class CameraDescription {
 ///
 /// [rttMicros] 与 [bytesSend] 依赖 RootEncoder 2.7.0+ RTMP 客户端（需开启 [setRtmpShouldSendPings] 后 RTT 才有效）。
 class StreamStatistics {
+  /// Configured capacity of the outbound queue. Constant for the life of the
+  /// stream -- compare against [itemsInCache], which is the live occupancy.
   final int? cacheSize;
+
+  /// How full the outbound queue actually is right now.
+  ///
+  /// This is the number that climbs when the network cannot keep up; [cacheSize]
+  /// alone cannot distinguish a congested stream from a healthy one. Null on
+  /// platforms or plugin versions that do not report it -- treat null as "not
+  /// known" and show nothing, never fall back to [cacheSize].
+  final int? itemsInCache;
   final int? sentAudioFrames;
   final int? sentVideoFrames;
   final int? droppedAudioFrames;
@@ -154,11 +164,12 @@ class StreamStatistics {
     this.fps,
     this.rttMicros,
     this.bytesSend,
+    this.itemsInCache,
   });
 
   @override
   String toString() {
-    return 'StreamStatistics{cacheSize: $cacheSize, sentAudioFrames: $sentAudioFrames, sentVideoFrames: $sentVideoFrames, droppedAudioFrames: $droppedAudioFrames, droppedVideoFrames: $droppedVideoFrames, isAudioMuted: $isAudioMuted, isVideoMuted: $isVideoMuted, bitrate: $bitrate, width: $width, height: $height, fps: $fps, rttMicros: $rttMicros, bytesSend: $bytesSend}';
+    return 'StreamStatistics{cacheSize: $cacheSize, itemsInCache: $itemsInCache, sentAudioFrames: $sentAudioFrames, sentVideoFrames: $sentVideoFrames, droppedAudioFrames: $droppedAudioFrames, droppedVideoFrames: $droppedVideoFrames, isAudioMuted: $isAudioMuted, isVideoMuted: $isVideoMuted, bitrate: $bitrate, width: $width, height: $height, fps: $fps, rttMicros: $rttMicros, bytesSend: $bytesSend}';
   }
 }
 
@@ -624,6 +635,7 @@ class CameraController extends ValueNotifier<CameraValue> {
         isAudioMuted: data["isAudioMuted"] as bool?,
         isVideoMuted: data["isVideoMuted"] as bool?,
         cacheSize: data["cacheSize"] as int?,
+        itemsInCache: data["itemsInCache"] as int?,
         droppedAudioFrames: data["droppedAudioFrames"] as int?,
         droppedVideoFrames: data["droppedVideoFrames"] as int?,
         fps: data["fps"] as int?,

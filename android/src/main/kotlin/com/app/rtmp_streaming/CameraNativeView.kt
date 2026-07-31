@@ -1167,7 +1167,13 @@ class CameraNativeView(
 
     fun getStreamStatistics(result: MethodChannel.Result) {
         val ret = hashMapOf<String, Any>()
+        // cacheSize is the configured *capacity* of the outbound queue -- a constant
+        // for the life of the stream. itemsInCache is how full that queue actually
+        // is right now, and is the one that climbs when the network cannot keep up.
+        // Reporting only the former makes a congested network look identical to a
+        // healthy one, so both are exposed and callers should read them as a pair.
         ret["cacheSize"] = rtmpCamera.streamClient.getCacheSize()
+        ret["itemsInCache"] = rtmpCamera.streamClient.getItemsInCache()
         ret["sentAudioFrames"] = rtmpCamera.streamClient.getSentAudioFrames()
         ret["sentVideoFrames"] = rtmpCamera.streamClient.getSentVideoFrames()
         ret["droppedAudioFrames"] = rtmpCamera.streamClient.getDroppedAudioFrames()

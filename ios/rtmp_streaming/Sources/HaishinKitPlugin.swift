@@ -636,7 +636,8 @@ public final class HaishinKitPlugin: NSObject,FlutterPlugin {
         return
       }
       Task {
-        print("connect Url \(url)")
+        // Never print the raw URL: its last path segment is the stream key.
+        print("connect Url \(redactStreamUrl(url))")
         let res = await startVideoStreaming(url: url,frameRate: bitrate ,isPlay: arguments["isPlay"] as? Bool)
         result(res)
       }

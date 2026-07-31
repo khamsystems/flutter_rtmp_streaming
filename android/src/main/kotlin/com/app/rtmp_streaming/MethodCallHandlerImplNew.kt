@@ -96,7 +96,13 @@ class MethodCallHandlerImplNew(
             }
 
             "startVideoStreaming" -> {
-                Log.i("Stuff", "startVideoStreaming ${call.arguments}")
+                // Never log call.arguments wholesale here: it carries the publish
+                // URL, whose last path segment is the stream key.
+                Log.i(
+                    "Stuff",
+                    "startVideoStreaming url=${redactStreamUrl(call.argument("url"))} " +
+                        "bitrate=${call.argument<Int>("bitrate")}"
+                )
                 getCameraView()?.startVideoStreaming(
                     call.argument("url"),
                     call.argument("bitrate"),
@@ -105,7 +111,13 @@ class MethodCallHandlerImplNew(
             }
 
             "startVideoRecordingAndStreaming" -> {
-                Log.i("Stuff", "startVideoRecordingAndStreaming ${call.arguments}")
+                // Same as above -- arguments carry the publish URL.
+                Log.i(
+                    "Stuff",
+                    "startVideoRecordingAndStreaming " +
+                        "url=${redactStreamUrl(call.argument("url"))} " +
+                        "bitrate=${call.argument<Int>("bitrate")}"
+                )
                 getCameraView()?.startVideoRecordingAndStreaming(
                     call.argument("filePath"),
                     call.argument("url"),

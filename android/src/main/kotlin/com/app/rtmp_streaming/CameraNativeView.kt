@@ -116,6 +116,16 @@ class CameraNativeView(
         glView.holder.addCallback(this)
         rtmpCamera = RtmpCamera2(glView, this)
         rtmpCamera.streamClient.setReTries(10)
+        // RootEncoder logs every AMF command it sends, and releaseStream/FCPublish/
+        // publish all carry the stream name -- which for Cloudflare Stream is the
+        // key itself. Redacting our own log lines is not enough while those are on,
+        // so the library's protocol logging is off by default.
+        //
+        // What survives is the part that is actually useful for debugging a connect
+        // failure: the ConnectChecker callbacks below (started / success / failed
+        // with reason / disconnect / auth error) all still fire and are forwarded to
+        // Dart, and this class's own logs are redacted rather than silenced.
+        rtmpCamera.streamClient.setLogs(false)
         rtmpCamera.setFpsListener { fps = it }
         bitrateAdapter = BitrateAdapter {
             rtmpCamera.setVideoBitrateOnFly(it)
@@ -434,7 +444,7 @@ class CameraNativeView(
 
 
     fun startVideoStreaming(url: String?, bitrate: Int?, result: MethodChannel.Result) {
-        Log.d("CameraNativeView", "startVideoStreaming url: $url")
+        Log.d("CameraNativeView", "startVideoStreaming url: ${redactStreamUrl(url)}")
         if (url == null) {
             result.error("startVideoStreaming", "Must specify a url.", null)
             return
@@ -1139,7 +1149,10 @@ class CameraNativeView(
             (rtmpCamera.streamClient as? RtmpStreamClient)?.shouldSendPings(rtmpShouldSendPings)
             val prepared = prepareAudioEncoder() && prepareVideoEncoder(size, bitrateRes)
             if (rtmpCamera.isRecording || prepared) {
-                Log.d("CameraNativeView", "resumeStreamAfterSurfaceChange: $url")
+                Log.d(
+                    "CameraNativeView",
+                    "resumeStreamAfterSurfaceChange: ${redactStreamUrl(url)}"
+                )
                 rtmpCamera.startStream(url)
             } else {
                 isRestoringFromSurfaceDestroy = false

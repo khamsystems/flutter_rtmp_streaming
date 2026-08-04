@@ -110,6 +110,16 @@ class CameraNativeView(
     private var resumeStreamAfterSurfaceCreated = false
     /** 因 Surface 销毁暂停推流时，忽略 stopStream 触发的 onDisconnect */
     private var isRestoringFromSurfaceDestroy = false
+
+    /**
+     * True while the session is rendering to an off-screen surface because the
+     * preview surface has gone.
+     *
+     * The session is fully live in this state -- streaming, recording, camera
+     * open. Only the on-screen preview is absent, which is the correct thing to
+     * be absent when there is no surface to draw on.
+     */
+    private var isRenderingOffScreen = false
     init {
 //        glView.isKeepAspectRatio = true
         glView.setAspectRatioMode(AspectRatioMode.Adjust)
@@ -163,19 +173,59 @@ class CameraNativeView(
         // TODO("Not yet implemented")
     }
 
+    /**
+     * The preview surface has gone.
+     *
+     * This does **not** mean the session has gone, and the two used to be
+     * conflated. The old behaviour stopped the stream and closed the camera
+     * whenever the surface went, which made an ordinary, unavoidable event into
+     * the end of capture.
+     *
+     * Measured on device 2026-08-04, with the native callback logged: this fires
+     * when a phone call ends, when the phone is woken from a locked screen, when
+     * the app is swiped out of recents, and at least once spontaneously thirteen
+     * seconds into a session with nobody touching the phone. Notably it does
+     * *not* fire on pressing Home, and it does not fire when the screen is
+     * locked -- only when it is woken again. So this is not something the coach
+     * does; it is something that happens.
+     *
+     * `replaceView(Context)` is RootEncoder's supported answer: it swaps the
+     * on-screen renderer for an off-screen one, closing and reopening the camera
+     * around the swap while leaving the encoders running. The stream is never
+     * stopped, so there is no reconnection to make and no gap in the recording
+     * beyond the moment the camera takes to reopen.
+     */
     override fun surfaceDestroyed(p0: SurfaceHolder) {
         Log.d("CameraNativeView", "surfaceDestroyed")
-        if (rtmpCamera.isStreaming) {
-            resumeStreamAfterSurfaceCreated = true
-            isRestoringFromSurfaceDestroy = true
+        isSurfaceCreated = false
+
+        if (rtmpCamera.isStreaming || rtmpCamera.isRecording) {
             try {
-                rtmpCamera.stopStream()
+                rtmpCamera.replaceView(glView.context.applicationContext)
+                isRenderingOffScreen = true
+                Log.d("CameraNativeView", "rendering off-screen, capture continues")
+                return
             } catch (e: Exception) {
-                Log.e("CameraNativeView", "stopStream on surfaceDestroyed failed", e)
-                isRestoringFromSurfaceDestroy = false
-                resumeStreamAfterSurfaceCreated = false
+                // Fall through to the old teardown. It loses the stream until the
+                // surface comes back, which is bad -- but it is what this did
+                // before, so a failure here is no worse than the previous
+                // behaviour rather than a new way to lose a session.
+                Log.e("CameraNativeView", "replaceView to off-screen failed, falling back", e)
+                isRenderingOffScreen = false
+                if (rtmpCamera.isStreaming) {
+                    resumeStreamAfterSurfaceCreated = true
+                    isRestoringFromSurfaceDestroy = true
+                    try {
+                        rtmpCamera.stopStream()
+                    } catch (e2: Exception) {
+                        Log.e("CameraNativeView", "stopStream on surfaceDestroyed failed", e2)
+                        isRestoringFromSurfaceDestroy = false
+                        resumeStreamAfterSurfaceCreated = false
+                    }
+                }
             }
         }
+
         if (rtmpCamera.isOnPreview) {
             try {
                 rtmpCamera.stopCamera()
@@ -183,7 +233,6 @@ class CameraNativeView(
                 Log.e("CameraNativeView", "stopCamera on surfaceDestroyed failed", e)
             }
         }
-        isSurfaceCreated = false
     }
 
     override fun onConnectionStarted(url: String) {
@@ -1118,6 +1167,35 @@ class CameraNativeView(
         if (!isSurfaceCreated) {
             return
         }
+        // Capture never stopped -- it has just been rendering off-screen. Hand it
+        // back the visible view and there is nothing else to restore: no stream
+        // to reconnect, no recording to resume, no encoders to prepare.
+        if (isRenderingOffScreen) {
+            isRenderingOffScreen = false
+            try {
+                rtmpCamera.replaceView(glView)
+                // Covers the session having been stopped while off-screen: the
+                // view is handed back but there is no longer a running capture
+                // holding the camera open, so without this the preview returns
+                // black.
+                if (!rtmpCamera.isOnPreview) startPreview(cameraName)
+                Log.d("CameraNativeView", "rendering back on-screen")
+                return
+            } catch (e: Exception) {
+                // The session is still live off-screen; only the preview is
+                // wrong. Losing the picture on the phone is a great deal better
+                // than tearing down a running session to fix it, so this is
+                // reported and left alone.
+                Log.e("CameraNativeView", "replaceView back to preview failed", e)
+                getActivity()?.runOnUiThread {
+                    dartMessenger?.send(
+                        DartMessenger.EventType.ERROR,
+                        "the preview could not be restored; the session is still running"
+                    )
+                }
+                return
+            }
+        }
         if (resumeStreamAfterSurfaceCreated && lastStreamUrl != null) {
             resumeStreamAfterSurfaceChange()
             return
@@ -1151,8 +1229,49 @@ class CameraNativeView(
             applyBitrateCeiling(bitrateRes)
             rtmpCamera.forceBt709Color(forceBt709Color)
             (rtmpCamera.streamClient as? RtmpStreamClient)?.shouldSendPings(rtmpShouldSendPings)
-            val prepared = prepareAudioEncoder() && prepareVideoEncoder(size, bitrateRes)
-            if (rtmpCamera.isRecording || prepared) {
+            // The short-circuit here is load-bearing, not style.
+            //
+            // A running recording means the encoders are already prepared, and
+            // RootEncoder throws IllegalStateException("Encoder already prepared")
+            // if prepareAudio/prepareVideo is called again. This used to read
+            //
+            //     val prepared = prepareAudioEncoder() && prepareVideoEncoder(...)
+            //     if (rtmpCamera.isRecording || prepared) { ... }
+            //
+            // which evaluates the prepare *before* testing isRecording, so with a
+            // recording up it threw every time -- before ever reaching startStream.
+            // The whole surface-restore path therefore never worked while
+            // recording, which is what turned an ordinary surface cycle into a
+            // permanently dead stream and a closed camera.
+            //
+            // Measured on device 2026-08-04: reproduced on the end of a phone
+            // call, on waking from a locked screen, and once spontaneously
+            // thirteen seconds into a session with nobody touching the phone.
+            //
+            // startVideoStreaming has always had this the right way round. Keep
+            // the two consistent, and do not hoist this out of the `if` again.
+            if (rtmpCamera.isRecording ||
+                (prepareAudioEncoder() && prepareVideoEncoder(size, bitrateRes))
+            ) {
+                // Reopen the camera before restarting the stream.
+                //
+                // Not optional, and the reason is easy to miss: RootEncoder's
+                // startStream only calls startEncoders when no recording is
+                // running, and startEncoders is the only thing in that path that
+                // reopens the camera and re-attaches the encoder's input surface.
+                // With a recording up it calls requestKeyFrame instead, so the
+                // camera stopCamera() closed above is never reopened.
+                //
+                // Without this the stream comes back and sends a frozen frame.
+                // That is worse than the dead stream it replaces: a still image
+                // over a healthy-looking connection is a failure nothing reports,
+                // where a dead stream at least shows as one.
+                //
+                // startPreview is safe here -- it guards on onPreview, which
+                // stopCamera() has just cleared, and not on isRecording.
+                if (!rtmpCamera.isOnPreview) {
+                    startPreview(cameraName)
+                }
                 Log.d(
                     "CameraNativeView",
                     "resumeStreamAfterSurfaceChange: ${redactStreamUrl(url)}"
@@ -1235,6 +1354,10 @@ class CameraNativeView(
         isSurfaceCreated = false
         resumeStreamAfterSurfaceCreated = false
         isRestoringFromSurfaceDestroy = false
+        // Cleared, but note what it does not do: this view is going away, so
+        // there is no point handing the renderer back to it. The camera is
+        // closed below and the session is over either way.
+        isRenderingOffScreen = false
         lastStreamUrl = null
         lastStreamBitrate = null
         if (rtmpCamera.isOnPreview) {

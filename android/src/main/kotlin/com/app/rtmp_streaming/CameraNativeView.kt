@@ -254,10 +254,12 @@ class CameraNativeView(
 
             override fun onCameraError(error: String) {
                 Log.e("CameraNativeView", "camera error: $error")
+                onCameraLost("camera error: $error")
             }
 
             override fun onCameraDisconnected() {
                 Log.w("CameraNativeView", "camera disconnected")
+                onCameraLost("the camera was taken away")
             }
         })
 
@@ -294,6 +296,47 @@ class CameraNativeView(
             if (gap > largestCameraFrameGapMs) largestCameraFrameGapMs = gap
         }
         lastCameraFrameAtMs = now
+    }
+
+    /**
+     * The camera announced that it has gone, rather than just going quiet.
+     *
+     * Measured 2026-08-04: waking the phone fired `onCameraDisconnected` at
+     * 17:12:29.446, and the frame-gap timeout did not notice until 17:12:33.161
+     * -- 3.7 seconds later. Recovery then took under a second. Acting on the
+     * announcement instead of waiting for the timeout is therefore worth about
+     * three quarters of the whole outage.
+     *
+     * The timeout is not redundant and stays: it is what catches a camera that
+     * stops delivering frames *without* saying anything, which is the case that
+     * produced a 135-second freeze.
+     *
+     * Recovery still goes through the same capped, backing-off path -- a camera
+     * that is being taken away repeatedly must not be fought over in a loop any
+     * more than a silent one.
+     */
+    private fun onCameraLost(reason: String) {
+        // Posted rather than run here: this arrives on the camera thread, and
+        // recovery touches GL and the camera manager, which belong to the main
+        // thread.
+        stallHandler.post {
+            if (!rtmpCamera.isStreaming && !rtmpCamera.isRecording) {
+                // No session, so nothing to rescue. This also covers the camera
+                // being closed as part of an ordinary stop.
+                return@post
+            }
+            val now = SystemClock.elapsedRealtime()
+            if (cameraStallStartedAtMs == 0L) {
+                // Dated from the last frame that arrived, not from now, so the
+                // reported outage covers the whole gap.
+                cameraStallStartedAtMs =
+                    if (lastCameraFrameAtMs != 0L) lastCameraFrameAtMs else now
+                cameraEverStalled = true
+                Log.w("CameraNativeView", "camera lost: $reason")
+                sendStallEvent(DartMessenger.EventType.CAMERA_STALLED, reason, now)
+            }
+            maybeRecoverFromStall(now)
+        }
     }
 
     private val stallWatchdog = object : Runnable {

@@ -163,6 +163,11 @@ class CameraNativeView(
     private var lastRecoveryAtMs = 0L
     private var reportedGivingUp = false
 
+    /** Set when the reopen in the last recovery attempt failed outright. */
+    @Volatile
+    private var lastReopenFailed = false
+    private var failedOpenRetries = 0
+
     /**
      * How long without a camera frame before the picture is called stalled.
      *
@@ -209,6 +214,29 @@ class CameraNativeView(
      */
     private val healthyResetMs = 10 * 60 * 1000L
 
+    /**
+     * How soon to try again when the reopen itself failed.
+     *
+     * A reopen that fails with `Open camera failed` did not cycle anything. The
+     * camera is simply still held by whoever took it, and nothing about the
+     * session changed. Charging that to the escalating backoff -- which exists
+     * to stop *harmful cycling* looping -- punishes the app for someone else's
+     * timing.
+     *
+     * Measured 2026-08-04, and this is the whole cost of getting it wrong: one
+     * attempt landing 3089ms into a stall failed, and the 10-second backoff it
+     * armed turned what should have been a one-second recovery into 14205ms. A
+     * near-identical run whose first attempt landed at 3715ms found the camera
+     * free and recovered in 4772ms. The difference between the two was luck.
+     *
+     * So a failed open retries on a short fixed interval and does not spend the
+     * main budget. It has a separate, smaller budget of its own, because
+     * retrying forever against a camera that is never coming back is its own
+     * kind of loop.
+     */
+    private val failedOpenRetryIntervalMs = 2000L
+    private val maxFailedOpenRetries = 10
+
     private val stallHandler = Handler(Looper.getMainLooper())
     init {
 //        glView.isKeepAspectRatio = true
@@ -252,9 +280,13 @@ class CameraNativeView(
                 Log.d("CameraNativeView", "camera changed to $facing")
             }
 
-            // Logged, deliberately not acted on. See onCameraLost.
             override fun onCameraError(error: String) {
                 Log.e("CameraNativeView", "camera error: $error")
+                // A failed *reopen* is not a stall and is not this app cycling
+                // anything -- the camera is still held by whoever took it. It is
+                // noted so the next attempt comes quickly and does not spend the
+                // budget meant for cycles that actually happened.
+                if (error.contains("Open camera failed")) noteReopenFailure()
             }
 
             override fun onCameraDisconnected() {
@@ -298,6 +330,28 @@ class CameraNativeView(
     }
 
     /**
+     * Records that the camera could not be reopened, and refunds the attempt.
+     *
+     * Only counted when it arrives on the heels of an attempt this class made;
+     * an open failure at any other time belongs to something else entirely.
+     */
+    private fun noteReopenFailure() {
+        stallHandler.post {
+            val since = SystemClock.elapsedRealtime() - lastRecoveryAtMs
+            if (lastRecoveryAtMs == 0L || since > 1500) return@post
+            lastReopenFailed = true
+            failedOpenRetries++
+            // Refunded: nothing was cycled, so nothing should be charged for.
+            if (stallRecoveryAttempts > 0) stallRecoveryAttempts--
+            Log.w(
+                "CameraNativeView",
+                "reopen failed ${since}ms after attempt; refunded " +
+                    "(failedOpenRetries=$failedOpenRetries/$maxFailedOpenRetries)"
+            )
+        }
+    }
+
+    /**
      * Recovering the moment `onCameraDisconnected` fires was tried and is worse.
      * Do not reinstate it without new evidence.
      *
@@ -317,12 +371,17 @@ class CameraNativeView(
      * | timeout only | 1 | **4772ms** |
      * | on disconnect | 4, two of them failing instantly | **53930ms** |
      *
-     * The three-second timeout is not merely a detector; it is also, by
-     * accident, a grace period that outlasts whoever is holding the camera. That
-     * is why the slower path recovers and the faster one starves.
+     * An earlier version of this comment claimed the three-second timeout
+     * doubles as a grace period that outlasts whoever holds the camera. **That
+     * was wrong**, and a later run disproved it: at 17:24:11 the first attempt
+     * landed 3089ms into a stall and still failed with `Open camera failed: 2`.
+     * The 4772ms run was luck -- its attempt happened to land at 3715ms, by
+     * which point the camera was free.
      *
-     * If this is revisited, the thing to add is a delay before the first attempt
-     * -- not the removal of one.
+     * How long the camera stays held after a wake is simply variable, and
+     * sometimes longer than three seconds. So the real fault is not when the
+     * first attempt happens but what a failed one costs: see
+     * [failedOpenRetryIntervalMs].
      */
     private val stallWatchdog = object : Runnable {
         override fun run() {
@@ -430,7 +489,9 @@ class CameraNativeView(
      * happen, so the app has to do it itself.
      */
     private fun maybeRecoverFromStall(now: Long) {
-        if (stallRecoveryAttempts >= maxStallRecoveryAttempts) {
+        if (stallRecoveryAttempts >= maxStallRecoveryAttempts ||
+            failedOpenRetries > maxFailedOpenRetries
+        ) {
             if (!reportedGivingUp) {
                 reportedGivingUp = true
                 Log.e(
@@ -447,13 +508,24 @@ class CameraNativeView(
             return
         }
 
-        // Exponential backoff, so a recovery that is itself causing the stall
-        // gets slower rather than faster.
-        val backoff = minOf(
-            recoveryBackoffCeilingMs,
-            recoveryBackoffBaseMs shl stallRecoveryAttempts,
-        )
+        // Two intervals, because there are two different situations.
+        //
+        // If the last reopen failed, nothing was cycled and the camera is simply
+        // still held: come back soon, on a fixed interval, until that stops
+        // being true or the separate failed-open budget runs out.
+        //
+        // Otherwise, exponential backoff, so a recovery that is itself causing
+        // the stall gets slower rather than faster.
+        val backoff = if (lastReopenFailed && failedOpenRetries <= maxFailedOpenRetries) {
+            failedOpenRetryIntervalMs
+        } else {
+            minOf(
+                recoveryBackoffCeilingMs,
+                recoveryBackoffBaseMs shl stallRecoveryAttempts,
+            )
+        }
         if (lastRecoveryAtMs != 0L && now - lastRecoveryAtMs < backoff) return
+        lastReopenFailed = false
 
         stallRecoveryAttempts++
         lastRecoveryAtMs = now
@@ -531,6 +603,8 @@ class CameraNativeView(
         stallRecoveryAttempts = 0
         lastRecoveryAtMs = 0L
         reportedGivingUp = false
+        lastReopenFailed = false
+        failedOpenRetries = 0
         largestCameraFrameGapMs = 0L
         // A session is starting, so make certain the watchdog is ticking even if
         // the surface callbacks have not run for some reason.

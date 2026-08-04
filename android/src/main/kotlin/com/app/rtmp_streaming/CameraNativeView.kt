@@ -339,6 +339,12 @@ class CameraNativeView(
         stallHandler.post {
             val since = SystemClock.elapsedRealtime() - lastRecoveryAtMs
             if (lastRecoveryAtMs == 0L || since > 1500) return@post
+            // One attempt, one refund. A recovery cycle makes two replaceView
+            // calls and a held camera fails both, which was counted twice --
+            // observed 2026-08-04 taking failedOpenRetries to 2/10 for a single
+            // attempt, quietly halving that budget. The flag is cleared when the
+            // next attempt is made, so this counts once per attempt.
+            if (lastReopenFailed) return@post
             lastReopenFailed = true
             failedOpenRetries++
             // Refunded: nothing was cycled, so nothing should be charged for.

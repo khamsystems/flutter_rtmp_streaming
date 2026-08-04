@@ -261,10 +261,26 @@ class CameraNativeView(
             }
         })
 
-        stallHandler.postDelayed(stallWatchdog, stallCheckIntervalMs)
+        // The watchdog is deliberately not started here. Kotlin initialises
+        // properties in declaration order, and the watchdog runnable is declared
+        // below this block, so referencing it from init reads an uninitialised
+        // field. It is started from surfaceCreated and from a session beginning,
+        // both of which are idempotent.
     }
 
     // --- Camera stall detection ----------------------------------------------
+
+    /**
+     * Starts the stall watchdog, or restarts it if it is already running.
+     *
+     * Idempotent by removing before posting, so the several places that
+     * legitimately want to be sure it is running cannot between them end up with
+     * two copies ticking.
+     */
+    private fun ensureStallWatchdogRunning() {
+        stallHandler.removeCallbacks(stallWatchdog)
+        stallHandler.postDelayed(stallWatchdog, stallCheckIntervalMs)
+    }
 
     /**
      * A frame arrived from the camera. Runs on the camera thread, so it does as
@@ -477,6 +493,9 @@ class CameraNativeView(
         lastRecoveryAtMs = 0L
         reportedGivingUp = false
         largestCameraFrameGapMs = 0L
+        // A session is starting, so make certain the watchdog is ticking even if
+        // the surface callbacks have not run for some reason.
+        ensureStallWatchdogRunning()
     }
 
     /**
@@ -508,6 +527,7 @@ class CameraNativeView(
     override fun surfaceCreated(holder: SurfaceHolder) {
         Log.d("CameraNativeView", "surfaceCreated")
         isSurfaceCreated = true
+        ensureStallWatchdogRunning()
         glView.post { restorePreviewAfterSurfaceChange() }
     }
 

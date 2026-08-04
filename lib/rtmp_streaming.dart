@@ -217,6 +217,43 @@ class CameraPreview extends StatelessWidget {
   }
 }
 
+/// Whether the RTMP connection is actually up, as distinct from whether a stream
+/// has been asked for.
+///
+/// [CameraValue.isStreamingVideoRtmp] answers the second question: the app called
+/// `startVideoStreaming` and has not called stop. That flag is what a Stop button
+/// should act on, and it is deliberately unaffected by the network.
+///
+/// It is not evidence that anything is arriving at the far end, and it used to be
+/// read as though it were. Through a network drop confirmed at the Cloudflare end
+/// the app went on reporting a healthy live stream, because nothing in the state
+/// it had could tell the difference. This enum is that missing half: it is driven
+/// only by the connection callbacks the encoder actually receives, so it can
+/// never claim a connection nobody observed.
+enum RtmpConnectionState {
+  /// No stream has been asked for.
+  idle,
+
+  /// Asked for, handshake not yet acknowledged.
+  connecting,
+
+  /// The far end accepted the connection. The only value that means "live".
+  connected,
+
+  /// The connection dropped and the client is retrying. Frames are being
+  /// dropped or queued; nothing is arriving at the far end.
+  reconnecting,
+
+  /// The plugin took the connection down itself and expects to bring it back --
+  /// the preview surface going away is the case this exists for. Distinct from
+  /// [reconnecting] because the cause is local rather than the network, and
+  /// distinct from [disconnected] because the session is not over.
+  interrupted,
+
+  /// Gone, with no retry outstanding.
+  disconnected,
+}
+
 /// The state of a [CameraController].
 class CameraValue {
   const CameraValue({
@@ -227,6 +264,7 @@ class CameraValue {
     this.isRecordingVideo,
     this.isTakingPicture,
     this.isStreamingVideoRtmp,
+    this.rtmpConnectionState = RtmpConnectionState.idle,
     this.event,
     bool? isRecordingPaused,
     bool? isStreamingPaused,
@@ -239,6 +277,7 @@ class CameraValue {
           isRecordingVideo: false,
           isTakingPicture: false,
           isStreamingVideoRtmp: false,
+          rtmpConnectionState: RtmpConnectionState.idle,
           isRecordingPaused: false,
           isStreamingPaused: false,
           previewQuarterTurns: 0,
@@ -256,6 +295,13 @@ class CameraValue {
 
   /// True when the camera is recording (not the same as previewing).
   final bool? isStreamingVideoRtmp;
+
+  /// Whether the connection is actually up. See [RtmpConnectionState].
+  ///
+  /// Read this, not [isStreamingVideoRtmp], before telling anyone a stream is
+  /// live.
+  final RtmpConnectionState rtmpConnectionState;
+
   final bool? _isRecordingPaused;
   final bool? _isStreamingPaused;
 
@@ -289,6 +335,7 @@ class CameraValue {
     bool? isInitialized,
     bool? isRecordingVideo,
     bool? isStreamingVideoRtmp,
+    RtmpConnectionState? rtmpConnectionState,
     bool? isTakingPicture,
     String? errorDescription,
     Size? previewSize,
@@ -304,6 +351,7 @@ class CameraValue {
       previewQuarterTurns: previewQuarterTurns ?? this.previewQuarterTurns,
       isRecordingVideo: isRecordingVideo ?? this.isRecordingVideo,
       isStreamingVideoRtmp: isStreamingVideoRtmp ?? this.isStreamingVideoRtmp,
+      rtmpConnectionState: rtmpConnectionState ?? this.rtmpConnectionState,
       isTakingPicture: isTakingPicture ?? this.isTakingPicture,
       isRecordingPaused: isRecordingPaused ?? _isRecordingPaused,
       isStreamingPaused: isStreamingPaused ?? _isStreamingPaused,
@@ -322,7 +370,8 @@ class CameraValue {
         'errorDescription: $errorDescription, '
         'previewSize: $previewSize, '
         'previewQuarterTurns: $previewQuarterTurns, '
-        'isStreamingVideoRtmp: $isStreamingVideoRtmp)';
+        'isStreamingVideoRtmp: $isStreamingVideoRtmp, '
+        'rtmpConnectionState: ${rtmpConnectionState.name})';
   }
 }
 
@@ -431,32 +480,63 @@ class CameraController extends ValueNotifier<CameraValue> {
             value.copyWith(errorDescription: errorDescription, event: uniEvent);
         break;
       case 'camera_closing':
+        // The RTMP connection closed. That is all this event is evidence of.
+        //
+        // It used to clear isRecordingVideo too, which was a false assertion:
+        // the connection dropping says nothing about the muxer, and RootEncoder
+        // deliberately keeps a recording running when a stream stops. Clearing
+        // it made the app believe a file had been closed while it was still
+        // being written, and then refuse the call that would have closed it.
         value = value.copyWith(
             errorDescription: errorDescription,
-            isRecordingVideo: false,
             isStreamingVideoRtmp: false,
+            rtmpConnectionState: RtmpConnectionState.disconnected,
+            event: uniEvent);
+        break;
+      case 'rtmp_interrupted':
+        // The plugin took the connection down itself and intends to bring it
+        // back -- the preview surface going away is the case this exists for.
+        //
+        // This event replaces staying silent. Suppressing it left the app
+        // showing LIVE, polling statistics and reporting a healthy stream while
+        // the far end had seen the input stop. The session is genuinely still
+        // running, so isStreamingVideoRtmp stands; what changes is the one
+        // field that describes the connection, which is now not connected.
+        value = value.copyWith(
+            errorDescription: errorDescription,
+            rtmpConnectionState: RtmpConnectionState.interrupted,
             event: uniEvent);
         break;
       case 'rtmp_retry':
-        value =
-            value.copyWith(errorDescription: errorDescription, event: uniEvent);
+        // Retrying is not connected. Nothing is reaching the far end for as long
+        // as this lasts, and the app previously had no way to know it.
+        value = value.copyWith(
+            errorDescription: errorDescription,
+            rtmpConnectionState: RtmpConnectionState.reconnecting,
+            event: uniEvent);
         break;
       case 'rtmp_stopped':
         value = value.copyWith(
             errorDescription: errorDescription,
             isStreamingVideoRtmp: false,
+            rtmpConnectionState: RtmpConnectionState.disconnected,
             event: uniEvent);
         break;
       case 'success':
+        // The one event that is evidence of a live connection: the far end
+        // completed the handshake.
         value = value.copyWith(
             errorDescription: errorDescription,
             isStreamingVideoRtmp: true,
+            rtmpConnectionState: RtmpConnectionState.connected,
             isStreamingPaused: false,
             event: uniEvent);
         break;
       case 'wait':
-        value =
-            value.copyWith(errorDescription: errorDescription, event: uniEvent);
+        value = value.copyWith(
+            errorDescription: errorDescription,
+            rtmpConnectionState: RtmpConnectionState.connecting,
+            event: uniEvent);
         break;
       default:
         value =
@@ -827,6 +907,11 @@ class CameraController extends ValueNotifier<CameraValue> {
       });
       value = value.copyWith(
           isStreamingVideoRtmp: true,
+          // Connecting, not connected. The channel call returning means the
+          // native side accepted the request, not that any handshake has
+          // happened -- that arrives later as a `success` event, and only then
+          // is there evidence of a live connection.
+          rtmpConnectionState: RtmpConnectionState.connecting,
           isStreamingPaused: false,
           isRecordingVideo: true,
           isRecordingPaused: false);
@@ -867,8 +952,12 @@ class CameraController extends ValueNotifier<CameraValue> {
         'url': url,
         'bitrate': bitrate,
       });
-      value =
-          value.copyWith(isStreamingVideoRtmp: true, isStreamingPaused: false);
+      value = value.copyWith(
+          isStreamingVideoRtmp: true,
+          // See startVideoRecordingAndStreaming: the request being accepted is
+          // not the connection being made.
+          rtmpConnectionState: RtmpConnectionState.connecting,
+          isStreamingPaused: false);
     } on PlatformException catch (e) {
       throw CameraException(e.code, e.message);
     }
@@ -895,7 +984,9 @@ class CameraController extends ValueNotifier<CameraValue> {
       // isRecordingVideo here made the app believe a recording had ended while
       // it was still being written, and then blocked the stopVideoRecording
       // call that would actually have closed the file.
-      value = value.copyWith(isStreamingVideoRtmp: false);
+      value = value.copyWith(
+          isStreamingVideoRtmp: false,
+          rtmpConnectionState: RtmpConnectionState.idle);
       await _channel.invokeMethod<void>(
         'stopStreaming',
         <String, dynamic>{},
@@ -920,8 +1011,10 @@ class CameraController extends ValueNotifier<CameraValue> {
       );
     }
     try {
-      value =
-          value.copyWith(isStreamingVideoRtmp: false, isRecordingVideo: false);
+      value = value.copyWith(
+          isStreamingVideoRtmp: false,
+          isRecordingVideo: false,
+          rtmpConnectionState: RtmpConnectionState.idle);
       await _channel.invokeMethod<void>(
         'stopRecordingOrStreaming',
         <String, dynamic>{},
@@ -1313,6 +1406,7 @@ class CameraController extends ValueNotifier<CameraValue> {
     value = value.copyWith(
       isStreamingVideoRtmp: false,
       isRecordingVideo: false,
+      rtmpConnectionState: RtmpConnectionState.idle,
     );
     notifyListeners();
     super.dispose();

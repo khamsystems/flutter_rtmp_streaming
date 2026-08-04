@@ -218,7 +218,21 @@ class CameraNativeView(
 
     override fun onDisconnect() {
         if (isRestoringFromSurfaceDestroy) {
-            Log.d("CameraNativeView", "onDisconnect ignored during surface restore")
+            // Reported, not swallowed.
+            //
+            // This used to return here without telling Dart anything, which left
+            // the app showing LIVE, polling statistics and reporting a healthy
+            // stream while the far end had seen the input stop. The session is
+            // genuinely still running -- a restore is expected -- so this must
+            // not be reported as the stream ending; but "still running" and
+            // "connected" are different claims and only the first one is true.
+            Log.d("CameraNativeView", "onDisconnect during surface restore, reporting as interrupted")
+            activity?.runOnUiThread {
+                dartMessenger?.send(
+                    DartMessenger.EventType.RTMP_INTERRUPTED,
+                    "connection interrupted while the preview surface was gone"
+                )
+            }
             return
         }
         activity?.runOnUiThread {

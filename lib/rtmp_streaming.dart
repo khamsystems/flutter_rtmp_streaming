@@ -697,8 +697,13 @@ class CameraController extends ValueNotifier<CameraValue> {
       );
     }
     try {
-      value =
-          value.copyWith(isRecordingVideo: false, isStreamingVideoRtmp: false);
+      // Only the recording flag. The native `stopRecording` handler calls
+      // `stopRecord()` and nothing else -- it leaves an RTMP stream running --
+      // so clearing isStreamingVideoRtmp here recorded a state the device was
+      // not in. It also made the pair unusable together: a caller stopping both
+      // could not stop the stream afterwards, because stopVideoStreaming's own
+      // guard would see the flag this cleared and throw before reaching native.
+      value = value.copyWith(isRecordingVideo: false);
       await _channel.invokeMethod<void>(
         'stopRecording',
         <String, dynamic>{},
@@ -884,8 +889,13 @@ class CameraController extends ValueNotifier<CameraValue> {
       );
     }
     try {
-      value =
-          value.copyWith(isStreamingVideoRtmp: false, isRecordingVideo: false);
+      // Only the streaming flag -- the mirror of the change in
+      // stopVideoRecording. The native `stopStreaming` handler calls
+      // `stopStream()` and leaves a running recording alone, so clearing
+      // isRecordingVideo here made the app believe a recording had ended while
+      // it was still being written, and then blocked the stopVideoRecording
+      // call that would actually have closed the file.
+      value = value.copyWith(isStreamingVideoRtmp: false);
       await _channel.invokeMethod<void>(
         'stopStreaming',
         <String, dynamic>{},

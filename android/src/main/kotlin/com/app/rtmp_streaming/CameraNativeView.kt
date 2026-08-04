@@ -252,14 +252,13 @@ class CameraNativeView(
                 Log.d("CameraNativeView", "camera changed to $facing")
             }
 
+            // Logged, deliberately not acted on. See onCameraLost.
             override fun onCameraError(error: String) {
                 Log.e("CameraNativeView", "camera error: $error")
-                onCameraLost("camera error: $error")
             }
 
             override fun onCameraDisconnected() {
                 Log.w("CameraNativeView", "camera disconnected")
-                onCameraLost("the camera was taken away")
             }
         })
 
@@ -299,46 +298,32 @@ class CameraNativeView(
     }
 
     /**
-     * The camera announced that it has gone, rather than just going quiet.
+     * Recovering the moment `onCameraDisconnected` fires was tried and is worse.
+     * Do not reinstate it without new evidence.
      *
-     * Measured 2026-08-04: waking the phone fired `onCameraDisconnected` at
-     * 17:12:29.446, and the frame-gap timeout did not notice until 17:12:33.161
-     * -- 3.7 seconds later. Recovery then took under a second. Acting on the
-     * announcement instead of waiting for the timeout is therefore worth about
-     * three quarters of the whole outage.
+     * The reasoning looked sound: measured 2026-08-04, waking the phone fired
+     * `onCameraDisconnected` at 17:12:29.446 while the frame-gap timeout did not
+     * notice until 17:12:33.161, so acting on the announcement should have saved
+     * three and a half seconds of the outage.
      *
-     * The timeout is not redundant and stays: it is what catches a camera that
-     * stops delivering frames *without* saying anything, which is the case that
-     * produced a 135-second freeze.
+     * Measured, it cost forty-nine. Whatever takes the camera on a wake still
+     * holds it for a second or two afterwards, so the immediate reopen fails
+     * with `Open camera failed: 2` -- and it fails having already spent one of
+     * the five recovery attempts. The next attempt is then held off by the
+     * exponential backoff that the wasted one just armed.
      *
-     * Recovery still goes through the same capped, backing-off path -- a camera
-     * that is being taken away repeatedly must not be fought over in a loop any
-     * more than a silent one.
+     * | build | attempts | total stalled |
+     * |---|---|---|
+     * | timeout only | 1 | **4772ms** |
+     * | on disconnect | 4, two of them failing instantly | **53930ms** |
+     *
+     * The three-second timeout is not merely a detector; it is also, by
+     * accident, a grace period that outlasts whoever is holding the camera. That
+     * is why the slower path recovers and the faster one starves.
+     *
+     * If this is revisited, the thing to add is a delay before the first attempt
+     * -- not the removal of one.
      */
-    private fun onCameraLost(reason: String) {
-        // Posted rather than run here: this arrives on the camera thread, and
-        // recovery touches GL and the camera manager, which belong to the main
-        // thread.
-        stallHandler.post {
-            if (!rtmpCamera.isStreaming && !rtmpCamera.isRecording) {
-                // No session, so nothing to rescue. This also covers the camera
-                // being closed as part of an ordinary stop.
-                return@post
-            }
-            val now = SystemClock.elapsedRealtime()
-            if (cameraStallStartedAtMs == 0L) {
-                // Dated from the last frame that arrived, not from now, so the
-                // reported outage covers the whole gap.
-                cameraStallStartedAtMs =
-                    if (lastCameraFrameAtMs != 0L) lastCameraFrameAtMs else now
-                cameraEverStalled = true
-                Log.w("CameraNativeView", "camera lost: $reason")
-                sendStallEvent(DartMessenger.EventType.CAMERA_STALLED, reason, now)
-            }
-            maybeRecoverFromStall(now)
-        }
-    }
-
     private val stallWatchdog = object : Runnable {
         override fun run() {
             try {
@@ -387,7 +372,18 @@ class CameraNativeView(
             return
         }
 
-        if (cameraStallStartedAtMs != 0L) {
+        // A stall ends when a *new* frame arrives, which means one strictly
+        // later than the frame the stall was dated from. Testing only that the
+        // last frame is recent is not the same thing and is wrong: for the first
+        // three seconds of any stall the last frame is by definition recent, so
+        // that test reports an instant recovery of zero milliseconds and clears
+        // a stall that is still going.
+        //
+        // Observed doing exactly that on 2026-08-04 -- "camera recovered after
+        // 0ms" logged twice while the picture stayed frozen -- which also
+        // cleared the way for the real stall to be re-detected and spend another
+        // recovery attempt on the same outage.
+        if (cameraStallStartedAtMs != 0L && lastFrame > cameraStallStartedAtMs) {
             val stalledFor = lastFrame - cameraStallStartedAtMs
             totalCameraStalledMs += stalledFor
             cameraStallStartedAtMs = 0L

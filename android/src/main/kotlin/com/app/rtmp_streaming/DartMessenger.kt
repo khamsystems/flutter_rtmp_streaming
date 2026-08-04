@@ -23,7 +23,25 @@ class DartMessenger(messenger: BinaryMessenger, eventChannelId: Int) {
          * seen the input stop. An app must not assert a state it has no evidence
          * for, so the interruption is now reported as what it is.
          */
-        RTMP_INTERRUPTED
+        RTMP_INTERRUPTED,
+
+        /**
+         * The camera has stopped delivering frames while a session is running.
+         *
+         * This is not the same as anything the encoder can report, and that is
+         * the whole point of it. Measured 2026-08-04: a camera stalled for 135
+         * seconds while the connection stayed up and the encoder went on
+         * reporting 30fps with no dropped frames, because a GL surface holding a
+         * still image keeps the encoder perfectly busy. Nothing in the app could
+         * tell. This event follows the camera hardware instead.
+         */
+        CAMERA_STALLED,
+
+        /** Frames started arriving again, after [CAMERA_STALLED]. */
+        CAMERA_RECOVERED,
+
+        /** The stall outlasted the recovery attempts allowed for one session. */
+        CAMERA_STALL_UNRECOVERED
     }
 
     fun sendCameraClosingEvent() {
@@ -31,15 +49,29 @@ class DartMessenger(messenger: BinaryMessenger, eventChannelId: Int) {
     }
 
     fun send(eventType: EventType, description: String?) {
+        send(eventType, description, null)
+    }
+
+    /**
+     * Sends an event, optionally with structured values alongside the
+     * description.
+     *
+     * [extra] exists because the stall events carry numbers -- how long the
+     * picture was frozen, which recovery attempt this is -- and those are the
+     * data the trigger threshold gets tuned from. Packing them into the
+     * description string would mean parsing prose on the other side.
+     */
+    fun send(eventType: EventType, description: String?, extra: Map<String, Any?>?) {
         if (eventSink == null) {
             return
         }
-        val event: MutableMap<String, String?> = HashMap()
+        val event: MutableMap<String, Any?> = HashMap()
         event["eventType"] = eventType.toString().lowercase()
         // Only errors have a description.
         if (!TextUtils.isEmpty(description)) {
             event["errorDescription"] = description
         }
+        extra?.forEach { (key, value) -> event[key] = value }
         eventSink!!.success(event)
     }
 

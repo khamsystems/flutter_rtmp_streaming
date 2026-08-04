@@ -7,6 +7,9 @@ import android.graphics.Color
 import android.hardware.camera2.CameraAccessException
 import android.media.MediaPlayer
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import com.pedro.encoder.input.gl.render.filters.BaseFilterRender
 import android.util.Log
 import android.util.Size
@@ -60,8 +63,10 @@ import com.pedro.encoder.input.gl.render.filters.`object`.GifObjectFilterRender
 import com.pedro.encoder.input.gl.render.filters.`object`.ImageObjectFilterRender
 import com.pedro.encoder.input.gl.render.filters.`object`.SurfaceFilterRender
 import com.pedro.encoder.input.gl.render.filters.`object`.TextObjectFilterRender
+import com.pedro.encoder.input.video.CameraCallbacks
 import com.pedro.encoder.input.video.CameraHelper
 import com.pedro.encoder.input.video.CameraHelper.Facing.BACK
+import com.pedro.encoder.input.video.FrameCapturedCallback
 import com.pedro.encoder.utils.gl.AspectRatioMode
 import com.pedro.encoder.utils.gl.TranslateTo
 import com.pedro.library.rtmp.RtmpCamera2
@@ -120,6 +125,91 @@ class CameraNativeView(
      * be absent when there is no surface to draw on.
      */
     private var isRenderingOffScreen = false
+
+    // --- Camera stall detection and recovery ---------------------------------
+    //
+    // Everything the app could previously see followed the *encoder*: fps,
+    // dropped frames, cache occupancy, the RTMP connection. None of them can
+    // detect a stopped camera, because a GL surface holding a still image keeps
+    // the encoder fully occupied producing frames of a photograph. Measured
+    // 2026-08-04: a camera stalled for 135 seconds of a 216-second session while
+    // every one of those signals reported perfect health.
+    //
+    // `enableFrameCaptureCallback` is fired from Camera2's own capture session
+    // (onCaptureStarted), so it follows the camera hardware and stops dead when
+    // the camera does. It is registered in `init` and not later, because the
+    // capture session only installs its callback if one is present when the
+    // session is created -- registering after the camera opens would do nothing
+    // until the next open.
+    //
+    // A stalled camera also corrupts the local recording: the file and the
+    // stream are muxed from the same encoder, so a frozen picture goes into
+    // both. This is the first failure mode the local backstop does not survive,
+    // which is why it is worth recovering from rather than only reporting.
+
+    /** When the camera last delivered a frame. Written from the camera thread. */
+    @Volatile
+    private var lastCameraFrameAtMs = 0L
+
+    /** Longest completed gap between camera frames this session, for tuning. */
+    @Volatile
+    private var largestCameraFrameGapMs = 0L
+
+    /** When the current stall began, or 0 when frames are arriving. */
+    private var cameraStallStartedAtMs = 0L
+    private var cameraEverStalled = false
+    private var totalCameraStalledMs = 0L
+    private var stallRecoveryAttempts = 0
+    private var lastRecoveryAtMs = 0L
+    private var reportedGivingUp = false
+
+    /**
+     * How long without a camera frame before the picture is called stalled.
+     *
+     * Provisional, and deliberately not a round number chosen for looking
+     * sensible. There is no body of camera-frame-interval measurements yet --
+     * this callback is new -- so it is derived from the closest thing there is,
+     * the gaps between *encoded* frames on clean sessions, which were 94ms
+     * undisturbed and 152-168ms during a phone call or around a stall.
+     *
+     * Three seconds is about eighteen times the worst of those. The margin is
+     * that wide on purpose: a false detection triggers a renderer cycle that
+     * itself costs the best part of a second of picture, so being trigger-happy
+     * has a real cost. Three seconds of frozen picture is a glitch; the failure
+     * this exists for was 135 seconds.
+     *
+     * Every session logs the largest camera-frame gap it saw. Set this from
+     * those once there are some.
+     */
+    private val cameraStallThresholdMs = 3000L
+
+    private val stallCheckIntervalMs = 1000L
+
+    /**
+     * Recovery attempts allowed before the app stops trying.
+     *
+     * The cap is the important half. Recovery works by cycling the renderer,
+     * which closes and reopens the camera -- so if cycling is *itself* what
+     * stalls the camera, an uncapped detector spins forever and the coach gets a
+     * session that is broken every few seconds instead of broken once. A loop is
+     * worse than a stall.
+     */
+    private val maxStallRecoveryAttempts = 5
+    private val recoveryBackoffBaseMs = 5000L
+    private val recoveryBackoffCeilingMs = 60000L
+
+    /**
+     * How long the camera must run cleanly before the attempt count resets.
+     *
+     * This is what tells the two cases apart. If recovery works and stalls are
+     * occasional, they arrive minutes apart and the budget should not be spent
+     * by a long session. If recovery is what causes the stall, the next one
+     * arrives within seconds and the budget is never refilled -- so the cap
+     * still bites, which is exactly when it needs to.
+     */
+    private val healthyResetMs = 10 * 60 * 1000L
+
+    private val stallHandler = Handler(Looper.getMainLooper())
     init {
 //        glView.isKeepAspectRatio = true
         glView.setAspectRatioMode(AspectRatioMode.Adjust)
@@ -135,6 +225,258 @@ class CameraNativeView(
             // the audio encoder is separately spending.
             setMaxBitrate(vBitrate)
         }
+
+        // Registered here, before any camera is opened, and not later: Camera2's
+        // capture session only attaches its callback if one is already present
+        // when the session is built, so setting this after the camera opens
+        // silently does nothing until the next open.
+        //
+        // It survives the camera being closed and reopened -- which is what
+        // recovery does -- because it is held on the camera manager, which
+        // outlives the session.
+        rtmpCamera.enableFrameCaptureCallback(object : FrameCapturedCallback {
+            override fun onFrameCaptured(timestamp: Long, frameNumber: Long) {
+                onCameraFrameDelivered()
+            }
+        })
+
+        // Lifecycle, not frames. A camera that errors or is taken away announces
+        // itself here, which is worth acting on immediately rather than waiting
+        // for the stall threshold to expire.
+        rtmpCamera.setCameraCallbacks(object : CameraCallbacks {
+            override fun onCameraOpened() {
+                Log.d("CameraNativeView", "camera opened")
+            }
+
+            override fun onCameraChanged(facing: CameraHelper.Facing) {
+                Log.d("CameraNativeView", "camera changed to $facing")
+            }
+
+            override fun onCameraError(error: String) {
+                Log.e("CameraNativeView", "camera error: $error")
+            }
+
+            override fun onCameraDisconnected() {
+                Log.w("CameraNativeView", "camera disconnected")
+            }
+        })
+
+        stallHandler.postDelayed(stallWatchdog, stallCheckIntervalMs)
+    }
+
+    // --- Camera stall detection ----------------------------------------------
+
+    /**
+     * A frame arrived from the camera. Runs on the camera thread, so it does as
+     * little as possible.
+     */
+    private fun onCameraFrameDelivered() {
+        val now = SystemClock.elapsedRealtime()
+        val previous = lastCameraFrameAtMs
+        if (previous != 0L) {
+            val gap = now - previous
+            if (gap > largestCameraFrameGapMs) largestCameraFrameGapMs = gap
+        }
+        lastCameraFrameAtMs = now
+    }
+
+    private val stallWatchdog = object : Runnable {
+        override fun run() {
+            try {
+                checkForCameraStall()
+            } catch (e: Exception) {
+                // Never allowed to take the session down. A watchdog that can
+                // kill the thing it is watching is worse than no watchdog.
+                Log.e("CameraNativeView", "camera stall check failed", e)
+            }
+            stallHandler.postDelayed(this, stallCheckIntervalMs)
+        }
+    }
+
+    private fun checkForCameraStall() {
+        // Only while something is being captured. A stalled preview on an idle
+        // app is nobody's problem, and recovering it would cycle the camera for
+        // no reason.
+        if (!rtmpCamera.isStreaming && !rtmpCamera.isRecording) return
+
+        val lastFrame = lastCameraFrameAtMs
+        if (lastFrame == 0L) return // no frames yet; nothing to be late
+
+        val now = SystemClock.elapsedRealtime()
+        val sinceLastFrame = now - lastFrame
+
+        if (sinceLastFrame >= cameraStallThresholdMs) {
+            if (cameraStallStartedAtMs == 0L) {
+                // Dated from the last frame that actually arrived, not from the
+                // moment it was noticed, so the reported duration is the length
+                // of the gap rather than the length of the gap minus the
+                // threshold.
+                cameraStallStartedAtMs = lastFrame
+                cameraEverStalled = true
+                Log.w(
+                    "CameraNativeView",
+                    "camera stalled: no frame for ${sinceLastFrame}ms " +
+                        "(threshold ${cameraStallThresholdMs}ms)"
+                )
+                sendStallEvent(
+                    DartMessenger.EventType.CAMERA_STALLED,
+                    "the camera stopped delivering frames",
+                    now,
+                )
+            }
+            maybeRecoverFromStall(now)
+            return
+        }
+
+        if (cameraStallStartedAtMs != 0L) {
+            val stalledFor = lastFrame - cameraStallStartedAtMs
+            totalCameraStalledMs += stalledFor
+            cameraStallStartedAtMs = 0L
+            reportedGivingUp = false
+            Log.w(
+                "CameraNativeView",
+                "camera recovered after ${stalledFor}ms " +
+                    "(attempts=$stallRecoveryAttempts total=${totalCameraStalledMs}ms)"
+            )
+            sendStallEvent(
+                DartMessenger.EventType.CAMERA_RECOVERED,
+                "the camera started delivering frames again",
+                now,
+                stalledForMs = stalledFor,
+            )
+            return
+        }
+
+        // Healthy. Give the recovery budget back once the camera has been fine
+        // for long enough that a further stall cannot plausibly be this app's
+        // own doing.
+        if (stallRecoveryAttempts > 0 &&
+            lastRecoveryAtMs != 0L &&
+            now - lastRecoveryAtMs >= healthyResetMs
+        ) {
+            Log.d(
+                "CameraNativeView",
+                "camera healthy for ${healthyResetMs}ms, resetting recovery budget"
+            )
+            stallRecoveryAttempts = 0
+            lastRecoveryAtMs = 0L
+        }
+    }
+
+    /**
+     * Cycles the renderer to reopen the camera, within a capped, backing-off
+     * budget.
+     *
+     * The cycle is the recovery that was observed working on 2026-08-04: a
+     * surface change moved rendering off-screen in 55ms and back in 884ms, the
+     * camera reopened, frames resumed, and the stream never dropped. The only
+     * reason it happened at all was that the phone was picked up and unlocked --
+     * which under the attention model for this app is exactly what will not
+     * happen, so the app has to do it itself.
+     */
+    private fun maybeRecoverFromStall(now: Long) {
+        if (stallRecoveryAttempts >= maxStallRecoveryAttempts) {
+            if (!reportedGivingUp) {
+                reportedGivingUp = true
+                Log.e(
+                    "CameraNativeView",
+                    "camera still stalled after $maxStallRecoveryAttempts recovery " +
+                        "attempts; giving up for this session"
+                )
+                sendStallEvent(
+                    DartMessenger.EventType.CAMERA_STALL_UNRECOVERED,
+                    "the camera could not be restarted",
+                    now,
+                )
+            }
+            return
+        }
+
+        // Exponential backoff, so a recovery that is itself causing the stall
+        // gets slower rather than faster.
+        val backoff = minOf(
+            recoveryBackoffCeilingMs,
+            recoveryBackoffBaseMs shl stallRecoveryAttempts,
+        )
+        if (lastRecoveryAtMs != 0L && now - lastRecoveryAtMs < backoff) return
+
+        stallRecoveryAttempts++
+        lastRecoveryAtMs = now
+        Log.w(
+            "CameraNativeView",
+            "attempting camera recovery $stallRecoveryAttempts/$maxStallRecoveryAttempts " +
+                "after ${now - cameraStallStartedAtMs}ms stalled (backoff was ${backoff}ms)"
+        )
+        sendStallEvent(
+            DartMessenger.EventType.CAMERA_STALLED,
+            "restarting the camera",
+            now,
+        )
+
+        try {
+            cycleRendererToReopenCamera()
+        } catch (e: Exception) {
+            // The session is still running; only the recovery failed. Reporting
+            // and leaving it alone is better than tearing down a session that is
+            // at least still carrying sound.
+            Log.e("CameraNativeView", "camera recovery attempt failed", e)
+        }
+    }
+
+    /**
+     * Closes and reopens the camera by swapping the renderer.
+     *
+     * `replaceView` is the only public route that reopens the camera without
+     * stopping the encoders, which is what keeps the stream and the recording
+     * running across it.
+     */
+    private fun cycleRendererToReopenCamera() {
+        val context = glView.context.applicationContext
+        if (isRenderingOffScreen || !isSurfaceCreated) {
+            // Already off-screen. Swapping in a fresh off-screen renderer still
+            // closes and reopens the camera, which is the part that matters.
+            rtmpCamera.replaceView(context)
+            return
+        }
+        rtmpCamera.replaceView(context)
+        rtmpCamera.replaceView(glView)
+    }
+
+    private fun sendStallEvent(
+        eventType: DartMessenger.EventType,
+        description: String,
+        now: Long,
+        stalledForMs: Long? = null,
+    ) {
+        val stalledNow = cameraStallStartedAtMs != 0L
+        val currentStall = stalledForMs
+            ?: if (stalledNow) now - cameraStallStartedAtMs else 0L
+        getActivity()?.runOnUiThread {
+            dartMessenger?.send(
+                eventType,
+                description,
+                mapOf(
+                    "cameraStalled" to stalledNow,
+                    "cameraEverStalled" to cameraEverStalled,
+                    "currentStallMillis" to currentStall,
+                    "totalStalledMillis" to totalCameraStalledMs + if (stalledNow) currentStall else 0L,
+                    "recoveryAttempts" to stallRecoveryAttempts,
+                    "maxRecoveryAttempts" to maxStallRecoveryAttempts,
+                    "largestFrameGapMillis" to largestCameraFrameGapMs,
+                ),
+            )
+        }
+    }
+
+    /** Clears per-session stall state. Called when a session actually starts. */
+    private fun resetStallTracking() {
+        cameraStallStartedAtMs = 0L
+        cameraEverStalled = false
+        totalCameraStalledMs = 0L
+        stallRecoveryAttempts = 0
+        lastRecoveryAtMs = 0L
+        reportedGivingUp = false
+        largestCameraFrameGapMs = 0L
     }
 
     /**
@@ -461,6 +803,9 @@ class CameraNativeView(
             return
         }
         Log.d("CameraNativeView", "startVideoRecording filePath: $filePath result: $result")
+        // Same guard as startVideoStreaming, from the other side: only reset when
+        // this call is what begins the session.
+        if (!rtmpCamera.isStreaming && !rtmpCamera.isRecording) resetStallTracking()
 
 
         /*if (rtmpCamera.isRecording || rtmpCamera.prepareAudio() && rtmpCamera.prepareVideo(
@@ -505,6 +850,12 @@ class CameraNativeView(
 
         try {
             if (!rtmpCamera.isStreaming) {
+                // A session is actually beginning here, so the stall counters
+                // start again. Guarded on !isStreaming rather than run
+                // unconditionally: callers start the recording immediately after
+                // the stream, and resetting on both would wipe the stream's
+                // history a moment after creating it.
+                if (!rtmpCamera.isRecording) resetStallTracking()
                 lastStreamUrl = url
                 lastStreamBitrate = bitrate
                 val streamingSize = CameraUtils.computeBestPreviewSize(getActivity(), cameraName, preset)
@@ -1318,6 +1669,20 @@ class CameraNativeView(
         ret["width"] = rtmpCamera.streamWidth
         ret["height"] = rtmpCamera.streamHeight
         ret["fps"] = fps
+        // The only figures here that follow the camera rather than the encoder.
+        // Everything above keeps reporting health through a frozen picture --
+        // measured 2026-08-04, 135 seconds of still image at a reported 30fps
+        // with no dropped frames -- so these are the ones to read when the
+        // question is whether anything is being captured.
+        ret["largestCameraFrameGapMillis"] = largestCameraFrameGapMs
+        ret["cameraStalled"] = cameraStallStartedAtMs != 0L
+        ret["cameraEverStalled"] = cameraEverStalled
+        ret["totalCameraStalledMillis"] = totalCameraStalledMs +
+            if (cameraStallStartedAtMs != 0L) {
+                SystemClock.elapsedRealtime() - cameraStallStartedAtMs
+            } else {
+                0L
+            }
         val rtmpSc = rtmpCamera.streamClient as? RtmpStreamClient
         ret["rttMicros"] = rtmpSc?.getRtt() ?: 0
         result.success(ret)
@@ -1351,6 +1716,7 @@ class CameraNativeView(
     }
 
     override fun dispose() {
+        stallHandler.removeCallbacks(stallWatchdog)
         isSurfaceCreated = false
         resumeStreamAfterSurfaceCreated = false
         isRestoringFromSurfaceDestroy = false

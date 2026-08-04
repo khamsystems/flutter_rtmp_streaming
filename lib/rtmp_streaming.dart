@@ -150,6 +150,28 @@ class StreamStatistics {
   final int? rttMicros;
   final int? bytesSend;
 
+  /// Longest gap between two frames delivered by the *camera* this session, in
+  /// milliseconds.
+  ///
+  /// The one figure here that does not describe the encoder. Everything else --
+  /// [fps], [droppedVideoFrames], [itemsInCache] -- keeps reporting health when
+  /// the camera has stopped, because a still image keeps the encoder fully
+  /// occupied. This follows Camera2's capture session instead.
+  ///
+  /// Reported on every session, healthy or not, because the clean readings are
+  /// what the stall threshold gets set from.
+  final int? largestCameraFrameGapMillis;
+
+  /// Whether the camera is not delivering frames right now.
+  final bool? cameraStalled;
+
+  /// Whether it stalled at any point this session. Never cleared by recovery:
+  /// the picture was frozen for that stretch either way.
+  final bool? cameraEverStalled;
+
+  /// Total time the camera spent stalled this session, in milliseconds.
+  final int? totalCameraStalledMillis;
+
   StreamStatistics({
     required this.cacheSize,
     required this.sentAudioFrames,
@@ -165,6 +187,10 @@ class StreamStatistics {
     this.rttMicros,
     this.bytesSend,
     this.itemsInCache,
+    this.largestCameraFrameGapMillis,
+    this.cameraStalled,
+    this.cameraEverStalled,
+    this.totalCameraStalledMillis,
   });
 
   @override
@@ -254,6 +280,69 @@ enum RtmpConnectionState {
   disconnected,
 }
 
+/// Whether the camera is actually delivering pictures.
+///
+/// Separate from everything else in [CameraValue] because it is the only part
+/// driven by the camera rather than the encoder. A GL surface holding a still
+/// image keeps the encoder fully occupied, so `fps`, dropped-frame counts and
+/// the connection state all report perfect health through a frozen picture --
+/// measured on 2026-08-04, 135 seconds of still image inside a 216-second
+/// session with no signal of any kind.
+class CameraStallState {
+  const CameraStallState({
+    this.stalledNow = false,
+    this.everStalled = false,
+    this.totalStalled = Duration.zero,
+    this.recoveryAttempts = 0,
+    this.maxRecoveryAttempts = 0,
+    this.gaveUp = false,
+  });
+
+  /// The camera is not delivering frames at this moment.
+  final bool stalledNow;
+
+  /// It stalled at some point this session.
+  ///
+  /// Never cleared by recovery. The picture was frozen for that stretch whether
+  /// or not it came back, and a flag that reset itself would report the session
+  /// as clean.
+  final bool everStalled;
+
+  final Duration totalStalled;
+
+  /// How many times the plugin has cycled the renderer to reopen the camera.
+  final int recoveryAttempts;
+  final int maxRecoveryAttempts;
+
+  /// True once the attempt budget is spent and the picture is still frozen.
+  final bool gaveUp;
+
+  CameraStallState copyWith({
+    bool? stalledNow,
+    bool? everStalled,
+    Duration? totalStalled,
+    int? recoveryAttempts,
+    int? maxRecoveryAttempts,
+    bool? gaveUp,
+  }) {
+    return CameraStallState(
+      stalledNow: stalledNow ?? this.stalledNow,
+      everStalled: everStalled ?? this.everStalled,
+      totalStalled: totalStalled ?? this.totalStalled,
+      recoveryAttempts: recoveryAttempts ?? this.recoveryAttempts,
+      maxRecoveryAttempts: maxRecoveryAttempts ?? this.maxRecoveryAttempts,
+      gaveUp: gaveUp ?? this.gaveUp,
+    );
+  }
+
+  @override
+  String toString() =>
+      'CameraStallState(stalledNow: $stalledNow, everStalled: $everStalled, '
+      'totalStalled: ${totalStalled.inMilliseconds}ms, '
+      'recoveryAttempts: $recoveryAttempts/$maxRecoveryAttempts, '
+      'gaveUp: $gaveUp)';
+}
+
 /// The state of a [CameraController].
 class CameraValue {
   const CameraValue({
@@ -265,6 +354,7 @@ class CameraValue {
     this.isTakingPicture,
     this.isStreamingVideoRtmp,
     this.rtmpConnectionState = RtmpConnectionState.idle,
+    this.cameraStall = const CameraStallState(),
     this.event,
     bool? isRecordingPaused,
     bool? isStreamingPaused,
@@ -278,6 +368,7 @@ class CameraValue {
           isTakingPicture: false,
           isStreamingVideoRtmp: false,
           rtmpConnectionState: RtmpConnectionState.idle,
+          cameraStall: const CameraStallState(),
           isRecordingPaused: false,
           isStreamingPaused: false,
           previewQuarterTurns: 0,
@@ -301,6 +392,13 @@ class CameraValue {
   /// Read this, not [isStreamingVideoRtmp], before telling anyone a stream is
   /// live.
   final RtmpConnectionState rtmpConnectionState;
+
+  /// Whether pictures are actually being captured. See [CameraStallState].
+  ///
+  /// Check this as well as [rtmpConnectionState] before telling anyone a
+  /// session is healthy: a connected stream carrying a frozen picture satisfies
+  /// every other field here.
+  final CameraStallState cameraStall;
 
   final bool? _isRecordingPaused;
   final bool? _isStreamingPaused;
@@ -336,6 +434,7 @@ class CameraValue {
     bool? isRecordingVideo,
     bool? isStreamingVideoRtmp,
     RtmpConnectionState? rtmpConnectionState,
+    CameraStallState? cameraStall,
     bool? isTakingPicture,
     String? errorDescription,
     Size? previewSize,
@@ -352,6 +451,7 @@ class CameraValue {
       isRecordingVideo: isRecordingVideo ?? this.isRecordingVideo,
       isStreamingVideoRtmp: isStreamingVideoRtmp ?? this.isStreamingVideoRtmp,
       rtmpConnectionState: rtmpConnectionState ?? this.rtmpConnectionState,
+      cameraStall: cameraStall ?? this.cameraStall,
       isTakingPicture: isTakingPicture ?? this.isTakingPicture,
       isRecordingPaused: isRecordingPaused ?? _isRecordingPaused,
       isStreamingPaused: isStreamingPaused ?? _isStreamingPaused,
@@ -371,7 +471,8 @@ class CameraValue {
         'previewSize: $previewSize, '
         'previewQuarterTurns: $previewQuarterTurns, '
         'isStreamingVideoRtmp: $isStreamingVideoRtmp, '
-        'rtmpConnectionState: ${rtmpConnectionState.name})';
+        'rtmpConnectionState: ${rtmpConnectionState.name}, '
+        'cameraStall: $cameraStall)';
   }
 }
 
@@ -536,6 +637,31 @@ class CameraController extends ValueNotifier<CameraValue> {
         value = value.copyWith(
             errorDescription: errorDescription,
             rtmpConnectionState: RtmpConnectionState.connecting,
+            event: uniEvent);
+        break;
+      // The camera stall events. Deliberately do not touch
+      // isStreamingVideoRtmp or rtmpConnectionState: the stream really is up
+      // and really is connected. What has stopped is the supply of pictures
+      // into it, which is a separate claim and until now an unmakeable one.
+      case 'camera_stalled':
+      case 'camera_recovered':
+      case 'camera_stall_unrecovered':
+        value = value.copyWith(
+            errorDescription: errorDescription,
+            cameraStall: value.cameraStall.copyWith(
+              stalledNow: map?['cameraStalled'] as bool?,
+              // Latched true by the native side and never sent back to false,
+              // for the same reason the microphone warning does not clear on
+              // recovery: the picture was frozen for that stretch either way.
+              everStalled: map?['cameraEverStalled'] as bool?,
+              totalStalled: Duration(
+                  milliseconds:
+                      (map?['totalStalledMillis'] as num?)?.toInt() ?? 0),
+              recoveryAttempts: (map?['recoveryAttempts'] as num?)?.toInt(),
+              maxRecoveryAttempts:
+                  (map?['maxRecoveryAttempts'] as num?)?.toInt(),
+              gaveUp: eventType == 'camera_stall_unrecovered' ? true : null,
+            ),
             event: uniEvent);
         break;
       default:
@@ -721,6 +847,12 @@ class CameraController extends ValueNotifier<CameraValue> {
         fps: data["fps"] as int?,
         rttMicros: data["rttMicros"] as int?,
         bytesSend: (data["bytesSend"] as num?)?.toInt(),
+        largestCameraFrameGapMillis:
+            (data["largestCameraFrameGapMillis"] as num?)?.toInt(),
+        cameraStalled: data["cameraStalled"] as bool?,
+        cameraEverStalled: data["cameraEverStalled"] as bool?,
+        totalCameraStalledMillis:
+            (data["totalCameraStalledMillis"] as num?)?.toInt(),
       );
     } on PlatformException catch (e) {
       throw CameraException(e.code, e.message);
@@ -912,6 +1044,11 @@ class CameraController extends ValueNotifier<CameraValue> {
           // happened -- that arrives later as a `success` event, and only then
           // is there evidence of a live connection.
           rtmpConnectionState: RtmpConnectionState.connecting,
+          // A new session gets a clean stall record. The native side resets its
+          // own counters on the same transition; this keeps the two in step so
+          // the panel does not open a session already showing the last one's
+          // frozen picture.
+          cameraStall: const CameraStallState(),
           isStreamingPaused: false,
           isRecordingVideo: true,
           isRecordingPaused: false);
@@ -957,6 +1094,8 @@ class CameraController extends ValueNotifier<CameraValue> {
           // See startVideoRecordingAndStreaming: the request being accepted is
           // not the connection being made.
           rtmpConnectionState: RtmpConnectionState.connecting,
+          // See startVideoRecordingAndStreaming.
+          cameraStall: const CameraStallState(),
           isStreamingPaused: false);
     } on PlatformException catch (e) {
       throw CameraException(e.code, e.message);
